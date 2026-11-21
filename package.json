@@ -1,17 +1,17 @@
 {
   "name": "clicktone",
-  "version": "3.0.2",
+  "version": "3.0.3",
   "description": "A lightweight helper for UI sound feedback. It wraps the Web Audio API with a tiny, event-based API and a rock-solid iOS/Safari unlock.",
-  "author": "ux-ui.pro",
+  "author": "Maxim <m@nilmuse.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ux-ui-pro/clicktone.git"
+    "url": "git+https://github.com/nilmuse/clicktone.git"
   },
   "bugs": {
-    "url": "https://github.com/ux-ui-pro/clicktone/issues"
+    "url": "https://github.com/nilmuse/clicktone/issues"
   },
-  "homepage": "https://github.com/ux-ui-pro/clicktone",
+  "homepage": "https://github.com/nilmuse/clicktone",
   "sideEffects": false,
   "type": "module",
   "packageManager": "npm@10.9.3",
