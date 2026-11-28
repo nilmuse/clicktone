@@ -1,7 +1,8 @@
 import { engine } from './engine/SharedAudioEngine';
-import { clampVolume, noop } from './runtime';
-import { resolveBestSource } from './source';
+import { abortable, clampVolume, noop } from './runtime';
+import { resolveBestSource, resolveSources } from './source';
 import type {
+  ClickToneCacheStats,
   ClickToneEventDetail,
   ClickToneEventType,
   ClickToneOptions,
@@ -12,13 +13,19 @@ import type {
 
 type ActivePlayback = {
   source: AudioBufferSourceNode;
-  url: string;
+  urls: string[];
   loop: boolean;
   stopped: boolean;
+  finish: () => void;
+};
+
+type PendingPlayback = {
+  controller: AbortController;
+  context: AudioContext | null;
 };
 
 export class ClickTone extends EventTarget {
-  #url: string | null = null;
+  #urls: string[] = [];
   #initError: Error | null = null;
   #volume: number;
   #muted: boolean;
@@ -26,12 +33,16 @@ export class ClickTone extends EventTarget {
   #pitch: number;
   #loop: boolean;
   #replay: ReplayBehavior;
+  #fallback: boolean;
+  #maxVoices: number | null;
   #debug: boolean;
   #lastPlay = 0;
   #gain: GainNode | null = null;
   #activePlaybacks = new Set<ActivePlayback>();
+  #pendingPlaybacks = new Set<PendingPlayback>();
   #needsGainRefresh = false;
   #visibilityHandler: (() => void) | null = null;
+  #unlockUnsubscribe: (() => void) | null = null;
   #recreateUnsubscribe: (() => void) | null = null;
   #destroyed = false;
 
@@ -44,9 +55,15 @@ export class ClickTone extends EventTarget {
     preload = false,
     loop = false,
     replay = 'overlap',
+    fallback = false,
+    maxVoices = null,
     debug = false,
   }: ClickToneOptions) {
     super();
+
+    if (maxVoices !== null && (!Number.isSafeInteger(maxVoices) || maxVoices < 1)) {
+      throw new RangeError('maxVoices must be null or a positive safe integer.');
+    }
 
     this.#volume = clampVolume(volume);
     this.#muted = muted;
@@ -54,16 +71,18 @@ export class ClickTone extends EventTarget {
     this.#pitch = Math.min(1, Math.max(0, pitchVariation));
     this.#loop = loop;
     this.#replay = replay;
+    this.#fallback = fallback;
+    this.#maxVoices = maxVoices;
     this.#debug = debug;
 
     try {
-      this.#url = resolveBestSource(src);
+      this.#urls = resolveSources(src);
     } catch (error) {
       this.#initError = error as Error;
     }
 
     engine.prime();
-    engine.onUnlock(() => this.#emit('unlock'));
+    this.#unlockUnsubscribe = engine.onUnlock(() => this.#emit('unlock'));
     this.#recreateUnsubscribe = engine.onRecreate(() => this.#restartActiveLoops());
 
     if (typeof document !== 'undefined') {
@@ -85,6 +104,21 @@ export class ClickTone extends EventTarget {
     return engine.unlocked;
   }
 
+  /** Snapshot of the shared decoded-buffer cache. Does not create an AudioContext. */
+  static get cacheStats(): ClickToneCacheStats {
+    return engine.cacheStats;
+  }
+
+  /** Set a global PCM byte budget. null disables eviction; 0 disables retention. */
+  static setCacheLimit(maxBytes: number | null): void {
+    engine.setCacheLimit(maxBytes);
+  }
+
+  /** Clear all cached sources, or the selected source. Playback and loading continue. */
+  static clearCache(src?: SoundInput): void {
+    engine.clearCache(src === undefined ? undefined : resolveBestSource(src));
+  }
+
   get volume(): number {
     return this.#volume;
   }
@@ -93,15 +127,28 @@ export class ClickTone extends EventTarget {
     return this.#muted;
   }
 
+  /** Whether a source has started and has not ended or been stopped. Excludes loading. */
   get playing(): boolean {
     return this.#activePlaybacks.size > 0;
   }
 
+  /** Number of started sources, including loops. Excludes pending play requests. */
+  get voiceCount(): number {
+    return this.#activePlaybacks.size;
+  }
+
+  /** Load the configured sound. Failures emit error and resolve with undefined. */
   async preload(): Promise<AudioBuffer | undefined> {
-    if (this.#destroyed || !this.#url) return undefined;
+    if (this.#destroyed || !this.#urls.length) return undefined;
 
     try {
-      const buffer = await engine.decode(this.#url);
+      const loaded = await this.#decodeSources(
+        this.#fallback ? this.#urls : this.#urls.slice(0, 1),
+      );
+
+      if (this.#destroyed || !loaded) return undefined;
+
+      const { buffer } = loaded;
 
       this.#emit('load', buffer);
 
@@ -111,6 +158,19 @@ export class ClickTone extends EventTarget {
 
       return undefined;
     }
+  }
+
+  /** Remove all configured source URLs from the shared cache without stopping playback. */
+  unload(): boolean {
+    if (this.#destroyed) return false;
+
+    let removed = false;
+
+    for (const url of this.#urls) {
+      if (engine.unload(url)) removed = true;
+    }
+
+    return removed;
   }
 
   unlock(): void {
@@ -136,57 +196,76 @@ export class ClickTone extends EventTarget {
     return this.#muted;
   }
 
+  /**
+   * Resolve on completion, stop, cancellation, or loop start. Errors emit error.
+   * Browser audio unlock can wait for a gesture; stop() and destroy() cancel it.
+   */
   async play(input?: SoundInput | PlayOptions): Promise<void> {
     await this.#play(this.#normalizePlayOptions(input));
   }
 
+  /** Cancel pending requests and stop all sources belonging to this instance. */
   stop(): void {
+    this.#cancelPendingPlaybacks();
     this.#stopActivePlaybacks(true);
   }
 
   async #play(
-    { src, loop = this.#loop, replay = this.#replay }: PlayOptions,
-    { skipThrottle = false }: { skipThrottle?: boolean } = {},
+    { src, loop = this.#loop, replay = this.#replay, fallback = this.#fallback }: PlayOptions,
+    { skipThrottle = false, urls: restoredUrls }: { skipThrottle?: boolean; urls?: string[] } = {},
   ): Promise<void> {
     if (this.#destroyed) return;
 
-    if (this.playing && replay === 'ignore-if-playing') return;
+    if ((this.playing || this.#pendingPlaybacks.size > 0) && replay === 'ignore-if-playing') return;
 
     const now = Date.now();
 
     if (!skipThrottle && replay !== 'restart' && now - this.#lastPlay < this.#throttle) return;
 
-    if (this.playing && (replay === 'interrupt' || replay === 'restart')) {
-      this.#stopActivePlaybacks(true);
-    }
+    const replace = replay === 'interrupt' || replay === 'restart';
+
+    if (replace) this.#cancelPendingPlaybacks();
 
     this.#lastPlay = now;
+    const request: PendingPlayback = { controller: new AbortController(), context: null };
+    const { signal } = request.controller;
 
-    engine.unlock();
+    this.#pendingPlaybacks.add(request);
 
-    let url: string;
+    if (replace) this.#stopActivePlaybacks(true);
 
-    try {
-      url = src ? resolveBestSource(src) : this.#requireUrl();
-    } catch (error) {
-      this.#fail(error as Error);
-
-      return;
-    }
+    let playback: ActivePlayback | undefined;
+    let preparedSource: AudioBufferSourceNode | undefined;
 
     try {
-      const ctx = await engine.ensureRunning();
+      if (signal.aborted) return;
+      engine.unlock();
+      if (signal.aborted) return;
 
-      if (!ctx || this.#destroyed) return;
+      const sources =
+        restoredUrls ?? (src !== undefined ? resolveSources(src) : this.#requireSources());
+      const urls = restoredUrls ?? (fallback ? sources : sources.slice(0, 1));
+
+      request.context = engine.context();
+      const ctx = await engine.ensureRunning(signal);
+
+      if (signal.aborted) return;
+      if (!ctx) throw new Error('Web Audio API is not available.');
+      if (ctx !== engine.context()) return;
       if (ctx.state !== 'running') throw new Error('AudioContext is not running.');
 
-      const buffer = await engine.decode(url);
+      const loaded = await this.#decodeSources(urls, signal);
 
-      if (ctx.state !== 'running') await ctx.resume().catch(noop);
+      if (!loaded || signal.aborted || ctx !== engine.context()) return;
+      const { buffer, url } = loaded;
+      if (ctx.state !== 'running') await abortable(ctx.resume(), signal);
+      if (signal.aborted || ctx !== engine.context()) return;
+      if (ctx.state !== 'running') throw new Error('AudioContext is not running.');
 
       const gain = this.#ensureGain(ctx);
       const source = ctx.createBufferSource();
 
+      preparedSource = source;
       source.buffer = buffer;
       source.loop = loop;
 
@@ -195,23 +274,45 @@ export class ClickTone extends EventTarget {
       }
 
       source.connect(gain);
-      const playback: ActivePlayback = { source, url, loop, stopped: false };
+      this.#makeRoomForVoice();
 
-      this.#activePlaybacks.add(playback);
+      // A stop listener may cancel this request or trigger context recovery.
+      if (signal.aborted || ctx !== engine.context()) return;
 
+      let finish = noop;
       const ended = new Promise<void>((resolve) => {
-        source.onended = (): void => {
-          this.#finishPlayback(playback, !playback.stopped);
-          resolve();
-        };
+        finish = resolve;
       });
+      const active: ActivePlayback = {
+        source,
+        urls: [url, ...urls.filter((candidate) => candidate !== url)],
+        loop,
+        stopped: false,
+        finish,
+      };
+
+      playback = active;
+      this.#activePlaybacks.add(active);
+      source.onended = (): void => this.#finishPlayback(active, !active.stopped);
 
       source.start(0);
+      this.#pendingPlaybacks.delete(request);
       this.#emit('play');
 
       if (!loop) await ended;
     } catch (error) {
-      this.#fail(error as Error);
+      if (playback) this.#finishPlayback(playback, false);
+      this.#pendingPlaybacks.delete(request);
+      if (!signal.aborted) this.#fail(error as Error);
+    } finally {
+      this.#pendingPlaybacks.delete(request);
+      if (preparedSource && !playback) {
+        try {
+          preparedSource.disconnect();
+        } catch {
+          /* already disconnected */
+        }
+      }
     }
   }
 
@@ -237,11 +338,15 @@ export class ClickTone extends EventTarget {
     this.addEventListener(type, handler as EventListener, { once: true });
   }
 
+  /** Permanently dispose this instance without interrupting other sounds' loading. */
   destroy(): void {
     if (this.#destroyed) return;
 
     this.#destroyed = true;
+    this.#cancelPendingPlaybacks();
     this.#stopActivePlaybacks(false);
+    this.#unlockUnsubscribe?.();
+    this.#unlockUnsubscribe = null;
     if (this.#visibilityHandler && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.#visibilityHandler);
       this.#visibilityHandler = null;
@@ -259,7 +364,25 @@ export class ClickTone extends EventTarget {
   }
 
   #isPlayOptions(input?: SoundInput | PlayOptions): input is PlayOptions {
-    return typeof input === 'object' && input !== null && ('loop' in input || 'replay' in input);
+    if (
+      typeof input !== 'object' ||
+      input === null ||
+      Array.isArray(input) ||
+      input instanceof URL ||
+      (typeof HTMLSourceElement !== 'undefined' && input instanceof HTMLSourceElement) ||
+      (typeof HTMLAudioElement !== 'undefined' && input instanceof HTMLAudioElement) ||
+      'id' in input
+    ) {
+      return false;
+    }
+
+    return (
+      'loop' in input ||
+      'replay' in input ||
+      'fallback' in input ||
+      !('src' in input) ||
+      typeof input.src !== 'string'
+    );
   }
 
   #stopActivePlaybacks(emitStop: boolean): void {
@@ -267,56 +390,114 @@ export class ClickTone extends EventTarget {
 
     if (!playbacks.length) return;
 
-    playbacks.forEach((playback) => {
-      playback.stopped = true;
-
-      try {
-        playback.source.stop(0);
-      } catch {
-        /* already stopped */
-      }
-
-      this.#finishPlayback(playback, false);
-    });
+    for (const playback of playbacks) {
+      this.#stopPlayback(playback);
+    }
 
     if (emitStop) this.#emit('stop');
+  }
+
+  #makeRoomForVoice(): void {
+    if (this.#maxVoices === null || this.#activePlaybacks.size < this.#maxVoices) return;
+
+    const oldest = this.#activePlaybacks.values().next().value;
+
+    if (!oldest) return;
+
+    this.#stopPlayback(oldest);
+    this.#emit('stop');
+  }
+
+  #stopPlayback(playback: ActivePlayback): void {
+    playback.stopped = true;
+
+    try {
+      playback.source.stop(0);
+    } catch {
+      /* already stopped */
+    }
+
+    this.#finishPlayback(playback, false);
+  }
+
+  #cancelPendingPlaybacks(onlyBoundContexts = false): void {
+    for (const request of this.#pendingPlaybacks) {
+      // The play() call triggering recovery has not captured a context yet.
+      // Keep it so that the same user gesture can start it on the new context.
+      if (onlyBoundContexts && !request.context) continue;
+
+      this.#pendingPlaybacks.delete(request);
+      request.controller.abort();
+    }
   }
 
   #finishPlayback(playback: ActivePlayback, emitEnd: boolean): void {
     if (!this.#activePlaybacks.delete(playback)) return;
 
+    playback.source.onended = null;
     try {
       playback.source.disconnect();
     } catch {
       /* already disconnected */
     }
 
+    playback.finish();
     if (emitEnd) this.#emit('end');
   }
 
   #restartActiveLoops(): void {
     if (this.#destroyed) return;
 
-    const loopUrls = [...this.#activePlaybacks]
+    const loopSources = [...this.#activePlaybacks]
       .filter((playback) => playback.loop)
-      .map((playback) => playback.url);
+      .map((playback) => playback.urls);
 
-    if (!loopUrls.length) return;
-
+    this.#cancelPendingPlaybacks(true);
     this.#stopActivePlaybacks(false);
-    loopUrls.forEach((src) => {
-      void this.#play({ src, loop: true, replay: 'overlap' }, { skipThrottle: true });
+    loopSources.forEach((urls) => {
+      void this.#play({ loop: true, replay: 'overlap' }, { skipThrottle: true, urls });
     });
   }
 
-  #requireUrl(): string {
-    if (this.#url) return this.#url;
+  #requireSources(): string[] {
+    if (this.#urls.length) return this.#urls;
 
     throw this.#initError ?? new Error('No valid sound source.');
   }
 
+  async #decodeSources(
+    urls: string[],
+    signal?: AbortSignal,
+  ): Promise<{ buffer: AudioBuffer; url: string } | undefined> {
+    if (this.#destroyed) return undefined;
+    if (signal?.aborted) throw signal.reason;
+    if (!engine.context()) throw new Error('Web Audio API is not available.');
+
+    const errors: unknown[] = [];
+
+    for (const url of urls) {
+      if (this.#destroyed) return undefined;
+      if (signal?.aborted) throw signal.reason;
+
+      try {
+        const buffer = await abortable(engine.decode(url), signal);
+
+        return { buffer, url };
+      } catch (error) {
+        if (signal?.aborted || this.#destroyed) throw error;
+
+        errors.push(error);
+      }
+    }
+
+    if (errors.length === 1) throw errors[0];
+
+    throw new AggregateError(errors, `Unable to load any sound source: ${urls.join(', ')}.`);
+  }
+
   #ensureGain(ctx: AudioContext): GainNode {
     if (!this.#gain || this.#gain.context !== ctx) {
+      this.#gain?.disconnect();
       this.#gain = ctx.createGain();
       this.#gain.gain.value = this.#muted ? 0 : this.#volume;
       this.#gain.connect(ctx.destination);
@@ -343,6 +524,8 @@ export class ClickTone extends EventTarget {
   }
 
   #emit<T extends ClickToneEventType>(type: T, detail?: ClickToneEventDetail[T]): void {
+    if (this.#destroyed) return;
+
     if (typeof CustomEvent !== 'undefined') {
       this.dispatchEvent(new CustomEvent(type, { detail }));
     } else if (typeof Event !== 'undefined') {
@@ -354,6 +537,8 @@ export class ClickTone extends EventTarget {
   }
 
   #fail(error: Error): void {
+    if (this.#destroyed) return;
+
     if (this.#debug) console.error('[ClickTone]', error);
 
     this.#emit('error', error);

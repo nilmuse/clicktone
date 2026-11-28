@@ -1,5 +1,7 @@
 import { UNLOCK_EVENTS } from '../constants';
-import { hasDOM, isAppleWebAudioFlaky, noop } from '../runtime';
+import { abortable, hasDOM, isAppleWebAudioFlaky, noop } from '../runtime';
+import type { ClickToneCacheStats } from '../types';
+import { AudioBufferCache } from './AudioBufferCache';
 
 /**
  * One AudioContext shared by every ClickTone instance. iOS caps the number of
@@ -14,12 +16,29 @@ export class SharedAudioEngine {
   #primed = false;
   #needsHardRecovery = false;
   #probing = false;
-  #decodeCache = new Map<string, Promise<AudioBuffer>>();
+  #decodeCache = new AudioBufferCache();
   #onUnlock = new Set<() => void>();
   #onRecreate = new Set<() => void>();
 
   get unlocked(): boolean {
     return this.#unlocked;
+  }
+
+  get cacheStats(): ClickToneCacheStats {
+    return this.#decodeCache.stats;
+  }
+
+  setCacheLimit(maxBytes: number | null): void {
+    this.#decodeCache.setLimit(maxBytes);
+  }
+
+  clearCache(url?: string): void {
+    if (url === undefined) this.#decodeCache.clear();
+    else this.#decodeCache.delete(url);
+  }
+
+  unload(url: string): boolean {
+    return this.#decodeCache.delete(url);
   }
 
   prime(): void {
@@ -69,6 +88,8 @@ export class SharedAudioEngine {
     void ctx
       .resume()
       .then(() => {
+        if (this.#ctx !== ctx || ctx.state !== 'running') return;
+
         if (this.#unlocked) {
           this.#playSilentPing();
         } else {
@@ -78,7 +99,7 @@ export class SharedAudioEngine {
       .catch(noop);
   }
 
-  async ensureRunning(): Promise<AudioContext | null> {
+  async ensureRunning(signal?: AbortSignal): Promise<AudioContext | null> {
     const ctx = this.context();
 
     if (!ctx) return null;
@@ -95,8 +116,10 @@ export class SharedAudioEngine {
       }
 
       try {
-        await ctx.resume();
-      } catch {
+        await abortable(ctx.resume(), signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+
         /* iOS may transiently reject resume */
       }
 
@@ -114,9 +137,9 @@ export class SharedAudioEngine {
     };
 
     if (await attempt()) return ctx;
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    await abortable(new Promise((resolve) => setTimeout(resolve, 120)), signal);
     if (await attempt()) return ctx;
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await abortable(new Promise((resolve) => setTimeout(resolve, 600)), signal);
     await attempt();
 
     return ctx;
@@ -178,9 +201,9 @@ export class SharedAudioEngine {
 
   /**
    * Tear down the current (potentially zombie) AudioContext and build a fresh
-   * one. AudioBuffers are bound to a specific context, so the decode cache must
-   * be dropped; ClickTone#ensureGain rebinds its GainNode when the context
-   * changes. Must be called inside a user gesture.
+   * one. GainNodes must be rebound to the new context. AudioBuffers can be
+   * shared across contexts; retain the existing conservative cache reset until
+   * buffer reuse is verified on real WebKit devices. Must run in a user gesture.
    */
   #recreate(): void {
     this.#needsHardRecovery = false;
@@ -207,14 +230,16 @@ export class SharedAudioEngine {
       .catch(noop);
   }
 
-  onUnlock(listener: () => void): void {
+  onUnlock(listener: () => void): () => void {
     if (this.#unlocked) {
       listener();
 
-      return;
+      return noop;
     }
 
     this.#onUnlock.add(listener);
+
+    return () => this.#onUnlock.delete(listener);
   }
 
   onRecreate(listener: () => void): () => void {
@@ -224,15 +249,11 @@ export class SharedAudioEngine {
   }
 
   decode(url: string): Promise<AudioBuffer> {
-    const cached = this.#decodeCache.get(url);
+    return this.#decodeCache.load(url, async () => {
+      const ctx = this.context();
 
-    if (cached) return cached;
+      if (!ctx) throw new Error('Web Audio API is not available.');
 
-    const ctx = this.context();
-
-    if (!ctx) return Promise.reject(new Error('Web Audio API is not available.'));
-
-    const promise = (async (): Promise<AudioBuffer> => {
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -240,12 +261,7 @@ export class SharedAudioEngine {
       }
 
       return ctx.decodeAudioData(await response.arrayBuffer());
-    })();
-
-    this.#decodeCache.set(url, promise);
-    promise.catch(() => this.#decodeCache.delete(url));
-
-    return promise;
+    });
   }
 
   #markUnlocked(): void {

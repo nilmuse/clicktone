@@ -2,6 +2,33 @@ export const hasDOM = typeof window !== 'undefined' && typeof document !== 'unde
 
 export const noop = (): void => {};
 
+export const abortable = <T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return promise;
+
+  return new Promise<T>((resolve, reject) => {
+    const cancel = (): void => reject(signal.reason);
+
+    if (signal.aborted) {
+      void promise.catch(noop);
+      cancel();
+
+      return;
+    }
+
+    signal.addEventListener('abort', cancel, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', cancel);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', cancel);
+        reject(error);
+      },
+    );
+  });
+};
+
 /**
  * iOS Safari (and desktop Safari) can leave an AudioContext in a "zombie"
  * state after a tab switch / lock-screen return: `state === 'running'` yet no

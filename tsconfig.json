@@ -1,4 +1,4 @@
 {
   "extends": "@nilmuse/tsconfig-base/tsconfig.json",
-  "include": ["src", "tsdown.config.ts", "vitest.config.ts"]
+  "include": ["src", "tests/browser", "tsdown.config.ts", "vitest.config.ts", "playwright.config.ts"]
 }
