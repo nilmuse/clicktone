@@ -1,5 +1,6 @@
 export { ClickTone } from './ClickTone';
 export type {
+  ClickToneCacheStats,
   ClickToneEventDetail,
   ClickToneEventType,
   ClickToneOptions,

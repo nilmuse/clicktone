@@ -58,10 +58,7 @@ const normalizeSource = (source: SoundSource): SoundDescriptor[] => {
   throw new Error('Invalid sound source.');
 };
 
-export const resolveBestSource = (input: SoundInput): string => {
-  const list = (Array.isArray(input) ? input : [input]).flatMap(normalizeSource);
-
-  if (!list.length) throw new Error('No sound source provided.');
+const selectBestSource = (list: SoundDescriptor[]): string => {
   if (list.length === 1 || !hasDOM) return list[0].src;
 
   const probe = document.createElement('audio');
@@ -80,3 +77,14 @@ export const resolveBestSource = (input: SoundInput): string => {
 
   return maybe ?? list[0].src;
 };
+
+/** Selected URL first, then unique alternatives in their declared order. */
+export const resolveSources = (input: SoundInput): string[] => {
+  const list = (Array.isArray(input) ? input : [input]).flatMap(normalizeSource);
+
+  if (!list.length) throw new Error('No sound source provided.');
+
+  return [...new Set([selectBestSource(list), ...list.map((item) => item.src)])];
+};
+
+export const resolveBestSource = (input: SoundInput): string => resolveSources(input)[0];

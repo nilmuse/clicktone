@@ -20,3 +20,10 @@ dist/
 .env
 .env.development
 .env.production
+
+# Handoff notes (local only)
+HANDOFF.md
+
+# Browser test output
+playwright-report/
+test-results/
