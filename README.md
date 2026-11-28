@@ -56,7 +56,7 @@ Each click plays the sound. `preload: true` fetches and decodes it in advance; p
 | `volume` | `number` | `1` | Playback volume, from `0` to `1`. |
 | `muted` | `boolean` | `false` | Start muted. Change it later with `setMuted()` or `toggleMuted()`. |
 | `throttle` | `number` | `0` | Minimum interval between accepted `play()` calls, in milliseconds. Earlier requests are ignored. |
-| `pitchVariation` | `number` | `0` | Random playback-rate variation, from `0` to `1`, so repeated clicks do not sound identical. |
+| `pitchVariation` | `number` | `0` | Random playback-rate variation, from `0` to `1`, so repeated clicks do not sound identical. Changes both pitch and duration. |
 | `preload` | `boolean` | `false` | Fetch and decode the sound when the instance is created. |
 | `loop` | `boolean` | `false` | Keep playing until `stop()` is called. |
 | `replay` | `ReplayBehavior` | `'overlap'` | What happens when this instance is already playing; see Replay behavior. |
@@ -125,15 +125,23 @@ Loading, decoding, and playback errors are reported through the `error` event. L
 | `play` | A buffer source starts. | None |
 | `end` | Playback finishes naturally. | None |
 | `stop` | One or more started sources are stopped by `stop()`, replay replacement, or a voice limit. Cancelling only pending requests does not emit it. | None |
-| `unlock` | The shared audio context becomes playable. | None |
+| `unlock` | The shared audio engine is first unlocked, or an instance is created after it has been unlocked. | None |
 | `load` | `preload()` fetches and decodes a source. | `AudioBuffer` |
 | `error` | Loading, decoding, or playback fails. | `Error` |
+
+`unlock` is emitted at most once per instance. For an instance created after the shared engine is unlocked, it is emitted synchronously during construction, before a listener can be attached. Check `ClickTone.unlocked` to handle that case.
 
 Continuing with `sound` from Quick start:
 
 ```ts
 const off = sound.on('end', () => console.log('finished'));
-sound.once('unlock', () => console.log('audio unlocked'));
+const onUnlocked = () => console.log('audio unlocked');
+
+if (ClickTone.unlocked) {
+  onUnlocked();
+} else {
+  sound.once('unlock', onUnlocked);
+}
 
 // When this subscription is no longer needed:
 off();
