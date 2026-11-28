@@ -18,6 +18,9 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # Match the publish toolchain while retaining bundled-npm coverage on Node 22.
+      - if: matrix.node == 24
+        run: npm install -g npm@latest
       - run: npm ci
       - run: npm run verify
 

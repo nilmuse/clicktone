@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.1
+
+- Fix packed-consumer checks for npm 12's package-name-keyed JSON output while retaining npm 10/11 support.
+- Run Node 24 verification with the same `npm@latest` toolchain used for publishing.
+- Publish the capabilities listed under 3.1.0 below. The 3.1.0 GitHub Release did not reach npm because its consumer check failed before publication.
+
 ## 3.1.0
 
 - Cancel pending playback on stop, destroy, replay replacement, and context recovery. Settle stopped one-shot promises independently of native `ended` events.
