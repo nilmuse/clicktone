@@ -28,11 +28,18 @@ function run(script, args, cwd = consumer) {
 }
 
 try {
-  const packed = JSON.parse(
+  const metadata = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  const output = JSON.parse(
     run(npm, ['pack', '--json', '--ignore-scripts', '--pack-destination', consumer], root),
   );
-  const tarball = join(consumer, packed[0].filename);
-  const metadata = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  // npm 10/11 return an array; npm 12 keys the result by package name.
+  const packed = Array.isArray(output)
+    ? output.find((entry) => entry.name === metadata.name)
+    : output[metadata.name];
+  if (!packed?.filename || !Array.isArray(packed.files)) {
+    throw new Error(`npm pack did not return metadata for ${metadata.name}.`);
+  }
+  const tarball = join(consumer, packed.filename);
   await writeFile(
     join(consumer, 'package.json'),
     JSON.stringify({ private: true, type: 'module' }),
@@ -66,7 +73,7 @@ try {
   console.log(
     `Packed ${metadata.name}@${metadata.version}: ESM, CommonJS, NodeNext, and bundler types passed on ${process.version}.`,
   );
-  const contents = packed[0].files.map((file) => file.path);
+  const contents = packed.files.map((file) => file.path);
   if (
     contents.some(
       (path) =>
