@@ -1,6 +1,6 @@
 {
   "name": "clicktone",
-  "version": "3.1.1",
+  "version": "3.1.2",
   "description": "A lightweight helper for UI sound feedback. It wraps the Web Audio API with a tiny, event-based API and a rock-solid iOS/Safari unlock.",
   "author": "Maxim <m@nilmuse.com>",
   "license": "MIT",
@@ -74,27 +74,18 @@
     "vitest": "^4.1.9"
   },
   "keywords": [
-    "MP3",
-    "WAV",
-    "OGG",
-    "AAC",
-    "iOS",
-    "sound",
     "audio",
+    "sound",
+    "ui-sounds",
+    "click-sound",
+    "sound-effects",
     "playback",
-    "mobile",
-    "click",
-    "tone",
-    "audioContext",
-    "webAudio",
-    "javascript",
-    "web",
-    "html5",
-    "media",
-    "music",
-    "effects",
-    "browser",
-    "webapp",
-    "frontend"
+    "web-audio",
+    "webaudio",
+    "audiocontext",
+    "audio-unlock",
+    "ios",
+    "safari",
+    "typescript"
   ]
 }
